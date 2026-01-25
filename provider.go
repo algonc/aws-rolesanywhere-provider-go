@@ -57,6 +57,12 @@ type Provider struct {
 	cachedCreds   aws.Credentials
 	expiration    time.Time
 	refreshMargin time.Duration // how long before expiry we proactively refresh
+
+	// test hooks
+	host     string
+	endpoint string
+	now      func() time.Time
+	readFile func(string) ([]byte, error)
 }
 
 // NewProvider constructs a new Provider with sensible defaults.
@@ -66,6 +72,8 @@ func NewProvider(opts ...Option) *Provider {
 		DurationSeconds: 3600,
 		refreshMargin:   5 * time.Minute,
 		HTTPClient:      http.DefaultClient,
+		now:             time.Now,
+		readFile:        os.ReadFile,
 	}
 	for _, o := range opts {
 		o(p)
@@ -111,7 +119,7 @@ func WithRefreshMargin(d time.Duration) Option {
 func (p *Provider) Retrieve(ctx context.Context) (aws.Credentials, error) {
 	// quick path: return cached creds if still valid
 	p.mu.Lock()
-	now := time.Now().UTC()
+	now := p.now().UTC()
 	if p.cachedCreds.CanExpire && now.Add(p.refreshMargin).Before(p.expiration) && p.cachedCreds.AccessKeyID != "" {
 		creds := p.cachedCreds
 		p.mu.Unlock()
@@ -165,7 +173,7 @@ type sessionCredentials struct {
 // createSessionAndGetCredentials performs the signing and CreateSession call.
 func (p *Provider) createSessionAndGetCredentials(ctx context.Context) (sessionCredentials, error) {
 	// 1) read private key
-	keyPEM, err := os.ReadFile(p.PrivateKeyPath)
+	keyPEM, err := p.readFile(p.PrivateKeyPath)
 	if err != nil {
 		return sessionCredentials{}, fmt.Errorf("reading private key: %w", err)
 	}
@@ -179,7 +187,7 @@ func (p *Provider) createSessionAndGetCredentials(ctx context.Context) (sessionC
 	}
 
 	// 2) read certificate
-	certPEM, err := os.ReadFile(p.CertificatePath)
+	certPEM, err := p.readFile(p.CertificatePath)
 	if err != nil {
 		return sessionCredentials{}, fmt.Errorf("reading certificate: %w", err)
 	}
@@ -206,10 +214,17 @@ func (p *Provider) createSessionAndGetCredentials(ctx context.Context) (sessionC
 
 	// 4) prepare SigV4-X509 signing values
 	service := "rolesanywhere"
-	host := fmt.Sprintf("%s.%s.amazonaws.com", service, p.Region)
-	endpoint := fmt.Sprintf("https://%s/sessions", host)
-	amzDate := time.Now().UTC().Format("20060102T150405Z")
-	dateStamp := time.Now().UTC().Format("20060102")
+	host := p.host
+	endpoint := p.endpoint
+	if host == "" {
+		host = fmt.Sprintf("%s.%s.amazonaws.com", service, p.Region)
+	}
+	if endpoint == "" {
+		endpoint = fmt.Sprintf("https://%s/sessions", host)
+	}
+	now := p.now().UTC()
+	amzDate := now.Format("20060102T150405Z")
+	dateStamp := now.Format("20060102")
 
 	contentType := "application/json"
 	canonicalURI := "/sessions"
