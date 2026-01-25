@@ -120,7 +120,7 @@ func (p *Provider) Retrieve(ctx context.Context) (aws.Credentials, error) {
 	p.mu.Unlock()
 
 	// Acquire new credentials
-	creds, expiry, err := p.createSessionAndGetCredentials(ctx)
+	creds, err := p.createSessionAndGetCredentials(ctx)
 	if err != nil {
 		return aws.Credentials{}, err
 	}
@@ -131,13 +131,13 @@ func (p *Provider) Retrieve(ctx context.Context) (aws.Credentials, error) {
 		SessionToken:    creds.SessionToken,
 		Source:          "RolesAnywhereProvider",
 		CanExpire:       true,
-		Expires:         expiry,
+		Expires:         creds.Expiration,
 	}
 
 	// cache
 	p.mu.Lock()
 	p.cachedCreds = awsCreds
-	p.expiration = expiry
+	p.expiration = creds.Expiration
 	p.mu.Unlock()
 
 	return awsCreds, nil
@@ -155,54 +155,37 @@ type createSessionResponse struct {
 	} `json:"credentialSet"`
 }
 
-// createSessionAndGetCredentials performs the signing and CreateSession call.
-func (p *Provider) createSessionAndGetCredentials(ctx context.Context) (struct {
+type sessionCredentials struct {
 	AccessKeyID     string
 	SecretAccessKey string
 	SessionToken    string
-}, time.Time, error) {
+	Expiration      time.Time
+}
+
+// createSessionAndGetCredentials performs the signing and CreateSession call.
+func (p *Provider) createSessionAndGetCredentials(ctx context.Context) (sessionCredentials, error) {
 	// 1) read private key
 	keyPEM, err := os.ReadFile(p.PrivateKeyPath)
 	if err != nil {
-		return struct {
-			AccessKeyID     string
-			SecretAccessKey string
-			SessionToken    string
-		}{}, time.Time{}, fmt.Errorf("reading private key: %w", err)
+		return sessionCredentials{}, fmt.Errorf("reading private key: %w", err)
 	}
 	privKey, err := parsePrivateKey(keyPEM)
 	if err != nil {
-		return struct {
-			AccessKeyID     string
-			SecretAccessKey string
-			SessionToken    string
-		}{}, time.Time{}, fmt.Errorf("parsing private key: %w", err)
+		return sessionCredentials{}, fmt.Errorf("parsing private key: %w", err)
 	}
 	rsaKey, ok := privKey.(*rsa.PrivateKey)
 	if !ok {
-		return struct {
-			AccessKeyID     string
-			SecretAccessKey string
-			SessionToken    string
-		}{}, time.Time{}, fmt.Errorf("private key is not RSA")
+		return sessionCredentials{}, fmt.Errorf("private key is not RSA")
 	}
 
 	// 2) read certificate
 	certPEM, err := os.ReadFile(p.CertificatePath)
 	if err != nil {
-		return struct {
-			AccessKeyID     string
-			SecretAccessKey string
-			SessionToken    string
-		}{}, time.Time{}, fmt.Errorf("reading certificate: %w", err)
+		return sessionCredentials{}, fmt.Errorf("reading certificate: %w", err)
 	}
 	cert, err := parseCertificate(certPEM)
 	if err != nil {
-		return struct {
-			AccessKeyID     string
-			SecretAccessKey string
-			SessionToken    string
-		}{}, time.Time{}, fmt.Errorf("parsing certificate: %w", err)
+		return sessionCredentials{}, fmt.Errorf("parsing certificate: %w", err)
 	}
 
 	certDerBase64 := base64.StdEncoding.EncodeToString(cert.Raw)
@@ -218,11 +201,7 @@ func (p *Provider) createSessionAndGetCredentials(ctx context.Context) (struct {
 	}
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
-		return struct {
-			AccessKeyID     string
-			SecretAccessKey string
-			SessionToken    string
-		}{}, time.Time{}, fmt.Errorf("marshal payload: %w", err)
+		return sessionCredentials{}, fmt.Errorf("marshal payload: %w", err)
 	}
 
 	// 4) prepare SigV4-X509 signing values
@@ -270,11 +249,7 @@ func (p *Provider) createSessionAndGetCredentials(ctx context.Context) (struct {
 	// sign stringToSign with RSA SHA256
 	signature, err := rsa.SignPKCS1v15(rand.Reader, rsaKey, crypto.SHA256, sha256Bytes([]byte(stringToSign)))
 	if err != nil {
-		return struct {
-			AccessKeyID     string
-			SecretAccessKey string
-			SessionToken    string
-		}{}, time.Time{}, fmt.Errorf("signing string: %w", err)
+		return sessionCredentials{}, fmt.Errorf("signing string: %w", err)
 	}
 
 	signatureHex := hex.EncodeToString(signature)
@@ -285,11 +260,7 @@ func (p *Provider) createSessionAndGetCredentials(ctx context.Context) (struct {
 	// 5) perform HTTP POST
 	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(payloadBytes))
 	if err != nil {
-		return struct {
-			AccessKeyID     string
-			SecretAccessKey string
-			SessionToken    string
-		}{}, time.Time{}, fmt.Errorf("creating request: %w", err)
+		return sessionCredentials{}, fmt.Errorf("creating request: %w", err)
 	}
 	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("X-Amz-Date", amzDate)
@@ -303,38 +274,22 @@ func (p *Provider) createSessionAndGetCredentials(ctx context.Context) (struct {
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return struct {
-			AccessKeyID     string
-			SecretAccessKey string
-			SessionToken    string
-		}{}, time.Time{}, fmt.Errorf("calling CreateSession: %w", err)
+		return sessionCredentials{}, fmt.Errorf("calling CreateSession: %w", err)
 	}
 	defer resp.Body.Close()
 
 	bodyBytes, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 201 {
-		return struct {
-			AccessKeyID     string
-			SecretAccessKey string
-			SessionToken    string
-		}{}, time.Time{}, fmt.Errorf("CreateSession failed: status=%d body=%s", resp.StatusCode, string(bodyBytes))
+		return sessionCredentials{}, fmt.Errorf("CreateSession failed: status=%d body=%s", resp.StatusCode, string(bodyBytes))
 	}
 
 	var parsed createSessionResponse
 	if err := json.Unmarshal(bodyBytes, &parsed); err != nil {
-		return struct {
-			AccessKeyID     string
-			SecretAccessKey string
-			SessionToken    string
-		}{}, time.Time{}, fmt.Errorf("parsing CreateSession response: %w (body=%s)", err, string(bodyBytes))
+		return sessionCredentials{}, fmt.Errorf("parsing CreateSession response: %w (body=%s)", err, string(bodyBytes))
 	}
 
 	if len(parsed.CredentialSet) == 0 {
-		return struct {
-			AccessKeyID     string
-			SecretAccessKey string
-			SessionToken    string
-		}{}, time.Time{}, fmt.Errorf("no credentialSet in response")
+		return sessionCredentials{}, fmt.Errorf("no credentialSet in response")
 	}
 
 	c := parsed.CredentialSet[0].Credentials
@@ -343,19 +298,16 @@ func (p *Provider) createSessionAndGetCredentials(ctx context.Context) (struct {
 		// fallback: try without TZ (rare)
 		expiry, err = time.Parse("2006-01-02T15:04:05", c.Expiration)
 		if err != nil {
-			return struct {
-				AccessKeyID     string
-				SecretAccessKey string
-				SessionToken    string
-			}{}, time.Time{}, fmt.Errorf("parsing expiration: %w (val=%s)", err, c.Expiration)
+			return sessionCredentials{}, fmt.Errorf("parsing expiration: %w (val=%s)", err, c.Expiration)
 		}
 	}
 
-	return struct {
-		AccessKeyID     string
-		SecretAccessKey string
-		SessionToken    string
-	}{AccessKeyID: c.AccessKeyID, SecretAccessKey: c.SecretAccessKey, SessionToken: c.SessionToken}, expiry, nil
+	return sessionCredentials{
+		AccessKeyID:     c.AccessKeyID,
+		SecretAccessKey: c.SecretAccessKey,
+		SessionToken:    c.SessionToken,
+		Expiration:      expiry,
+	}, nil
 }
 
 // helpers
