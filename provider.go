@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"crypto"
+	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -38,7 +39,7 @@ import (
 )
 
 // Provider implements aws.CredentialsProvider and obtains temporary credentials
-// from AWS RolesAnywhere by performing the SigV4-X509 RSA signing flow and calling CreateSession.
+// from AWS RolesAnywhere by performing the SigV4-X509 signing flow and calling CreateSession.
 type Provider struct {
 	PrivateKeyPath  string
 	CertificatePath string
@@ -181,9 +182,9 @@ func (p *Provider) createSessionAndGetCredentials(ctx context.Context) (sessionC
 	if err != nil {
 		return sessionCredentials{}, fmt.Errorf("parsing private key: %w", err)
 	}
-	rsaKey, ok := privKey.(*rsa.PrivateKey)
-	if !ok {
-		return sessionCredentials{}, fmt.Errorf("private key is not RSA")
+	algorithm, err := signingAlgorithmForPrivateKey(privKey)
+	if err != nil {
+		return sessionCredentials{}, err
 	}
 
 	// 2) read certificate
@@ -194,6 +195,9 @@ func (p *Provider) createSessionAndGetCredentials(ctx context.Context) (sessionC
 	cert, err := parseCertificate(certPEM)
 	if err != nil {
 		return sessionCredentials{}, fmt.Errorf("parsing certificate: %w", err)
+	}
+	if err := validatePrivateKeyMatchesCertificate(privKey, cert); err != nil {
+		return sessionCredentials{}, fmt.Errorf("validating private key and certificate: %w", err)
 	}
 
 	certDerBase64 := base64.StdEncoding.EncodeToString(cert.Raw)
@@ -251,7 +255,6 @@ func (p *Provider) createSessionAndGetCredentials(ctx context.Context) (sessionC
 		payloadHash,
 	}, "\n")
 
-	algorithm := "AWS4-X509-RSA-SHA256"
 	credentialScope := fmt.Sprintf("%s/%s/%s/aws4_request", dateStamp, p.Region, service)
 
 	stringToSign := strings.Join([]string{
@@ -261,8 +264,8 @@ func (p *Provider) createSessionAndGetCredentials(ctx context.Context) (sessionC
 		sha256Hex([]byte(canonicalRequest)),
 	}, "\n")
 
-	// sign stringToSign with RSA SHA256
-	signature, err := rsa.SignPKCS1v15(rand.Reader, rsaKey, crypto.SHA256, sha256Bytes([]byte(stringToSign)))
+	// RSA retains PKCS#1 v1.5; ECDSA uses an ASN.1 DER signature.
+	signature, err := signString(privKey, stringToSign)
 	if err != nil {
 		return sessionCredentials{}, fmt.Errorf("signing string: %w", err)
 	}
@@ -327,22 +330,72 @@ func (p *Provider) createSessionAndGetCredentials(ctx context.Context) (sessionC
 
 // helpers
 
-func parsePrivateKey(pemBytes []byte) (interface{}, error) {
+func parsePrivateKey(pemBytes []byte) (crypto.PrivateKey, error) {
 	var block *pem.Block
 	block, _ = pem.Decode(pemBytes)
 	if block == nil {
 		return nil, fmt.Errorf("no PEM block found")
 	}
-	// support PKCS1, PKCS8
+	// Support PKCS#1 RSA, SEC1 EC, and PKCS#8 RSA or EC keys.
 	if block.Type == "RSA PRIVATE KEY" {
 		return x509.ParsePKCS1PrivateKey(block.Bytes)
 	}
-	// assume PKCS8
+	if block.Type == "EC PRIVATE KEY" {
+		return x509.ParseECPrivateKey(block.Bytes)
+	}
+	// Preserve the existing PKCS#8 fallback for all other PEM block types.
 	k, err := x509.ParsePKCS8PrivateKey(block.Bytes)
 	if err != nil {
 		return nil, err
 	}
 	return k, nil
+}
+
+func signingAlgorithmForPrivateKey(privateKey crypto.PrivateKey) (string, error) {
+	switch privateKey.(type) {
+	case *rsa.PrivateKey:
+		return "AWS4-X509-RSA-SHA256", nil
+	case *ecdsa.PrivateKey:
+		return "AWS4-X509-ECDSA-SHA256", nil
+	default:
+		return "", fmt.Errorf("unsupported private key type %T; expected RSA or ECDSA", privateKey)
+	}
+}
+
+func validatePrivateKeyMatchesCertificate(privateKey crypto.PrivateKey, cert *x509.Certificate) error {
+	switch key := privateKey.(type) {
+	case *rsa.PrivateKey:
+		certKey, ok := cert.PublicKey.(*rsa.PublicKey)
+		if !ok {
+			return fmt.Errorf("RSA private key requires a certificate with an RSA public key")
+		}
+		if !key.PublicKey.Equal(certKey) {
+			return fmt.Errorf("RSA private key does not match certificate public key")
+		}
+	case *ecdsa.PrivateKey:
+		certKey, ok := cert.PublicKey.(*ecdsa.PublicKey)
+		if !ok {
+			return fmt.Errorf("EC private key requires a certificate with an EC public key")
+		}
+		if !key.PublicKey.Equal(certKey) {
+			return fmt.Errorf("EC private key does not match certificate public key")
+		}
+	default:
+		return fmt.Errorf("unsupported private key type %T; expected RSA or ECDSA", privateKey)
+	}
+	return nil
+}
+
+func signString(privateKey crypto.PrivateKey, stringToSign string) ([]byte, error) {
+	digest := sha256Bytes([]byte(stringToSign))
+	switch key := privateKey.(type) {
+	case *rsa.PrivateKey:
+		return rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, digest)
+	case *ecdsa.PrivateKey:
+		return ecdsa.SignASN1(rand.Reader, key, digest)
+	default:
+		return nil, fmt.Errorf("unsupported private key type %T; expected RSA or ECDSA", privateKey)
+	}
 }
 
 func parseCertificate(pemBytes []byte) (*x509.Certificate, error) {
