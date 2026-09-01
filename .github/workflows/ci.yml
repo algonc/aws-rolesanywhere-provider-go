@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  COVERAGE_THRESHOLD: "70.0"
+
+jobs:
+  validate:
+    name: Build, format, vet, and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Check formatting
+        shell: bash
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [[ -n "$unformatted" ]]; then
+            echo "::error::The following Go files are not formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Run static analysis
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Enforce coverage threshold
+        shell: bash
+        run: |
+          coverage="$(go tool cover -func=coverage.out | awk '/^total:/ {gsub(/%/, "", $3); print $3}')"
+          if [[ -z "$coverage" ]]; then
+            echo "::error::Unable to determine total test coverage."
+            exit 1
+          fi
+
+          echo "Total coverage: ${coverage}%"
+          echo "### Test coverage: ${coverage}%" >> "$GITHUB_STEP_SUMMARY"
+
+          if ! awk -v coverage="$coverage" -v threshold="$COVERAGE_THRESHOLD" \
+            'BEGIN { exit !(coverage + 0 >= threshold + 0) }'; then
+            echo "::error::Test coverage ${coverage}% is below the required ${COVERAGE_THRESHOLD}%."
+            exit 1
+          fi
