@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -45,16 +46,16 @@ jobs:
             exit 1
           fi
 
-      - name: Run static analysis
-        run: go vet ./...
-
-      - name: Build
-        run: go build ./...
+      - name: Lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.12.2
+          args: --timeout=5m
 
       - name: Test
         run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
 
-      - name: Enforce coverage threshold
+      - name: Check coverage
         shell: bash
         run: |
           coverage="$(go tool cover -func=coverage.out | awk '/^total:/ {gsub(/%/, "", $3); print $3}')"
@@ -71,3 +72,9 @@ jobs:
             echo "::error::Test coverage ${coverage}% is below the required ${COVERAGE_THRESHOLD}%."
             exit 1
           fi
+
+      - name: Check vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.3.0 ./...
+
+      - name: Build
+        run: go build ./...
