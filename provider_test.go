@@ -79,7 +79,7 @@ func TestProvider_Retrieve_Success(t *testing.T) {
 	fixedTime := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	expiry := fixedTime.Add(30 * time.Minute)
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"credentialSet": []any{
@@ -129,7 +129,7 @@ func TestProvider_Retrieve_UsesCache(t *testing.T) {
 	fixedTime := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	expiry := fixedTime.Add(time.Hour)
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		atomic.AddInt32(&calls, 1)
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -180,9 +180,11 @@ func TestProvider_Retrieve_UsesCache(t *testing.T) {
 func TestProvider_Retrieve_HTTPError(t *testing.T) {
 	keyPEM, certPEM := mustKeyAndCert(t)
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("boom"))
+		if _, err := w.Write([]byte("boom")); err != nil {
+			t.Errorf("write error response: %v", err)
+		}
 	}))
 	defer srv.Close()
 
