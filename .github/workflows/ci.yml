@@ -16,12 +16,18 @@ concurrency:
 
 env:
   COVERAGE_THRESHOLD: "70.0"
+  # Keep each compatibility check on the selected Go version.
+  GOTOOLCHAIN: local
 
 jobs:
   validate:
-    name: Build, format, vet, and test
+    name: Validate (Go ${{ matrix.go-version }})
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        go-version: ["1.22.x", "1.27.x"]
 
     steps:
       - name: Check out repository
@@ -30,7 +36,8 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: go.mod
+          go-version: ${{ matrix.go-version }}
+          check-latest: true
           cache-dependency-path: go.sum
 
       - name: Download dependencies
@@ -47,10 +54,14 @@ jobs:
           fi
 
       - name: Lint
+        if: matrix.go-version == '1.27.x'
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.12.2
+          version: v2.13.2
           args: --timeout=5m
+
+      - name: Run static analysis
+        run: go vet ./...
 
       - name: Test
         run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
@@ -74,6 +85,7 @@ jobs:
           fi
 
       - name: Check vulnerabilities
+        if: matrix.go-version == '1.27.x'
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.3.0 ./...
 
       - name: Build
