@@ -9,6 +9,8 @@ expiration.
 
 ## Installation
 
+Go 1.26.0 or later is required.
+
 ```sh
 go get github.com/algonc/aws-rolesanywhere-provider-go
 ```

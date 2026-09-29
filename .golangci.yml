@@ -4,7 +4,7 @@ run:
   timeout: 5m
   relative-path-mode: gomod
   modules-download-mode: readonly
-  go: "1.25.0"
+  go: "1.26.0"
 
 linters:
   default: standard
