@@ -81,8 +81,8 @@ The SDK retrieves credentials from the provider when making requests.
 
 The default session duration is one hour, and credentials are refreshed on retrieval
 within five minutes of expiration. Use `WithDurationSeconds` and
-`WithRefreshMargin` to adjust these values. `WithSessionName` sets the session name,
-and `WithHTTPClient` supplies a custom HTTP client.
+`WithRefreshMargin` to adjust these values. `WithSessionName` sets the role session
+name, and `WithHTTPClient` supplies a custom HTTP client.
 
 ## Supported private keys
 

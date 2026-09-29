@@ -15,7 +15,6 @@
 package rolesanywhere
 
 import (
-	"bytes"
 	"context"
 	"crypto"
 	"crypto/ecdsa"
@@ -23,15 +22,11 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
-	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"encoding/pem"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
@@ -54,30 +49,75 @@ type Provider struct {
 	HTTPClient *http.Client
 
 	// caching
-	mu            sync.Mutex
-	cachedCreds   aws.Credentials
-	expiration    time.Time
-	refreshMargin time.Duration // how long before expiry we proactively refresh
+	mu                 sync.Mutex
+	refresh            *refreshCall
+	cachedCreds        aws.Credentials
+	expiration         time.Time
+	cachedLifetime     time.Duration
+	nextRefreshAttempt time.Time
+	refreshMargin      time.Duration
+
+	requestTimeout         time.Duration
+	maxAttempts            int
+	retryBaseDelay         time.Duration
+	throttleRetryBaseDelay time.Duration
+	maxRetryDelay          time.Duration
+	refreshFailureDelay    time.Duration
 
 	// test hooks
-	host     string
-	endpoint string
-	now      func() time.Time
-	readFile func(string) ([]byte, error)
+	host        string
+	endpoint    string
+	now         func() time.Time
+	readFile    func(string) ([]byte, error)
+	sleep       func(context.Context, time.Duration) error
+	randFloat64 func() float64
+}
+
+type refreshCall struct {
+	done  chan struct{}
+	creds aws.Credentials
+	err   error
 }
 
 // NewProvider constructs a new Provider with sensible defaults.
 func NewProvider(opts ...Option) *Provider {
 	p := &Provider{
-		Region:          "us-east-1",
-		DurationSeconds: 3600,
-		refreshMargin:   5 * time.Minute,
-		HTTPClient:      http.DefaultClient,
-		now:             time.Now,
-		readFile:        os.ReadFile,
+		Region:                 "us-east-1",
+		DurationSeconds:        3600,
+		refreshMargin:          DefaultRefreshMargin,
+		HTTPClient:             http.DefaultClient,
+		requestTimeout:         DefaultRequestTimeout,
+		maxAttempts:            DefaultMaxAttempts,
+		retryBaseDelay:         DefaultRetryBaseDelay,
+		throttleRetryBaseDelay: DefaultThrottleRetryBaseDelay,
+		maxRetryDelay:          DefaultMaxRetryDelay,
+		refreshFailureDelay:    DefaultRefreshFailureDelay,
+		now:                    time.Now,
+		readFile:               os.ReadFile,
 	}
 	for _, o := range opts {
 		o(p)
+	}
+	if p.refreshMargin < 0 {
+		p.refreshMargin = 0
+	}
+	if p.requestTimeout <= 0 {
+		p.requestTimeout = DefaultRequestTimeout
+	}
+	if p.maxAttempts < 1 {
+		p.maxAttempts = 1
+	}
+	if p.retryBaseDelay <= 0 {
+		p.retryBaseDelay = DefaultRetryBaseDelay
+	}
+	if p.throttleRetryBaseDelay <= 0 {
+		p.throttleRetryBaseDelay = DefaultThrottleRetryBaseDelay
+	}
+	if p.maxRetryDelay <= 0 {
+		p.maxRetryDelay = DefaultMaxRetryDelay
+	}
+	if p.refreshFailureDelay <= 0 {
+		p.refreshFailureDelay = DefaultRefreshFailureDelay
 	}
 	return p
 }
@@ -116,21 +156,89 @@ func WithRefreshMargin(d time.Duration) Option {
 	return func(p *Provider) { p.refreshMargin = d }
 }
 
-// Retrieve implements aws.CredentialsProvider
+// WithRequestTimeout sets the timeout for each CreateSession HTTP attempt.
+func WithRequestTimeout(d time.Duration) Option {
+	return func(p *Provider) { p.requestTimeout = d }
+}
+
+// WithMaxAttempts sets the total number of CreateSession attempts. Set it to 1 to disable retries.
+func WithMaxAttempts(n int) Option {
+	return func(p *Provider) { p.maxAttempts = n }
+}
+
+// WithRetryBaseDelay sets the initial backoff limit for transient failures.
+func WithRetryBaseDelay(d time.Duration) Option {
+	return func(p *Provider) { p.retryBaseDelay = d }
+}
+
+// WithThrottleRetryBaseDelay sets the initial backoff limit for throttling failures.
+func WithThrottleRetryBaseDelay(d time.Duration) Option {
+	return func(p *Provider) { p.throttleRetryBaseDelay = d }
+}
+
+// WithMaxRetryDelay caps retry backoff and Retry-After delays.
+func WithMaxRetryDelay(d time.Duration) Option {
+	return func(p *Provider) { p.maxRetryDelay = d }
+}
+
+// WithRefreshFailureDelay sets how long valid cached credentials suppress another refresh after a failure.
+func WithRefreshFailureDelay(d time.Duration) Option {
+	return func(p *Provider) { p.refreshFailureDelay = d }
+}
+
+// Retrieve returns cached credentials or obtains a new Roles Anywhere session.
+// Concurrent refreshes share one request. A failed early refresh returns cached
+// credentials while they remain valid and delays the next refresh attempt.
 func (p *Provider) Retrieve(ctx context.Context) (aws.Credentials, error) {
-	// quick path: return cached creds if still valid
-	p.mu.Lock()
 	now := p.now().UTC()
-	if p.cachedCreds.CanExpire && now.Add(p.refreshMargin).Before(p.expiration) && p.cachedCreds.AccessKeyID != "" {
-		creds := p.cachedCreds
+	if creds, ok := p.cachedCredentials(now); ok {
+		return creds, nil
+	}
+
+	p.mu.Lock()
+	if creds, ok := p.cachedCredentialsLocked(p.now().UTC()); ok {
 		p.mu.Unlock()
 		return creds, nil
 	}
+	if call := p.refresh; call != nil {
+		p.mu.Unlock()
+		select {
+		case <-call.done:
+			return call.creds, call.err
+		case <-ctx.Done():
+			if creds, ok := p.validCachedCredentials(p.now().UTC()); ok {
+				return creds, nil
+			}
+			return aws.Credentials{}, ctx.Err()
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		if p.hasValidCachedCredentials(now) {
+			creds := p.cachedCreds
+			p.mu.Unlock()
+			return creds, nil
+		}
+		p.mu.Unlock()
+		return aws.Credentials{}, err
+	}
+	call := &refreshCall{done: make(chan struct{})}
+	p.refresh = call
 	p.mu.Unlock()
 
-	// Acquire new credentials
+	call.creds, call.err = p.refreshCredentials(ctx)
+	p.mu.Lock()
+	p.refresh = nil
+	close(call.done)
+	p.mu.Unlock()
+	return call.creds, call.err
+}
+
+func (p *Provider) refreshCredentials(ctx context.Context) (aws.Credentials, error) {
 	creds, err := p.createSessionAndGetCredentials(ctx)
 	if err != nil {
+		if cached, ok := p.useCachedCredentialsAfterFailure(p.now().UTC()); ok {
+			return cached, nil
+		}
 		return aws.Credentials{}, err
 	}
 
@@ -142,14 +250,60 @@ func (p *Provider) Retrieve(ctx context.Context) (aws.Credentials, error) {
 		CanExpire:       true,
 		Expires:         creds.Expiration,
 	}
-
-	// cache
 	p.mu.Lock()
 	p.cachedCreds = awsCreds
 	p.expiration = creds.Expiration
+	p.cachedLifetime = creds.Expiration.Sub(p.now().UTC())
+	p.nextRefreshAttempt = time.Time{}
 	p.mu.Unlock()
-
 	return awsCreds, nil
+}
+
+func (p *Provider) cachedCredentials(now time.Time) (aws.Credentials, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.cachedCredentialsLocked(now)
+}
+
+func (p *Provider) cachedCredentialsLocked(now time.Time) (aws.Credentials, bool) {
+	if !p.hasValidCachedCredentials(now) {
+		return aws.Credentials{}, false
+	}
+	margin := p.refreshMargin
+	if p.cachedLifetime > 0 && margin > p.cachedLifetime/2 {
+		margin = p.cachedLifetime / 2
+	}
+	if now.Before(p.expiration.Add(-margin)) || now.Before(p.nextRefreshAttempt) {
+		return p.cachedCreds, true
+	}
+	return aws.Credentials{}, false
+}
+
+func (p *Provider) validCachedCredentials(now time.Time) (aws.Credentials, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.hasValidCachedCredentials(now) {
+		return aws.Credentials{}, false
+	}
+	return p.cachedCreds, true
+}
+
+func (p *Provider) useCachedCredentialsAfterFailure(now time.Time) (aws.Credentials, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.hasValidCachedCredentials(now) {
+		return aws.Credentials{}, false
+	}
+	delay := p.refreshFailureDelay
+	if remaining := p.expiration.Sub(now); delay > remaining/2 {
+		delay = remaining / 2
+	}
+	p.nextRefreshAttempt = now.Add(delay)
+	return p.cachedCreds, true
+}
+
+func (p *Provider) hasValidCachedCredentials(now time.Time) bool {
+	return p.cachedCreds.CanExpire && p.cachedCreds.HasKeys() && now.Before(p.expiration)
 }
 
 // internal struct used for parsing JSON response
@@ -169,163 +323,6 @@ type sessionCredentials struct {
 	SecretAccessKey string
 	SessionToken    string
 	Expiration      time.Time
-}
-
-// createSessionAndGetCredentials performs the signing and CreateSession call.
-func (p *Provider) createSessionAndGetCredentials(ctx context.Context) (sessionCredentials, error) {
-	// 1) read private key
-	keyPEM, err := p.readFile(p.PrivateKeyPath)
-	if err != nil {
-		return sessionCredentials{}, fmt.Errorf("reading private key: %w", err)
-	}
-	privKey, err := parsePrivateKey(keyPEM)
-	if err != nil {
-		return sessionCredentials{}, fmt.Errorf("parsing private key: %w", err)
-	}
-	algorithm, err := signingAlgorithmForPrivateKey(privKey)
-	if err != nil {
-		return sessionCredentials{}, err
-	}
-
-	// 2) read certificate
-	certPEM, err := p.readFile(p.CertificatePath)
-	if err != nil {
-		return sessionCredentials{}, fmt.Errorf("reading certificate: %w", err)
-	}
-	cert, err := parseCertificate(certPEM)
-	if err != nil {
-		return sessionCredentials{}, fmt.Errorf("parsing certificate: %w", err)
-	}
-	if err := validatePrivateKeyMatchesCertificate(privKey, cert); err != nil {
-		return sessionCredentials{}, fmt.Errorf("validating private key and certificate: %w", err)
-	}
-
-	certDerBase64 := base64.StdEncoding.EncodeToString(cert.Raw)
-	serialDec := cert.SerialNumber.String()
-
-	// 3) build request payload
-	payload := map[string]interface{}{
-		"durationSeconds": p.DurationSeconds,
-		"profileArn":      p.ProfileArn,
-		"roleArn":         p.RoleArn,
-		"sessionName":     p.SessionName,
-		"trustAnchorArn":  p.TrustAnchorArn,
-	}
-	payloadBytes, err := json.Marshal(payload)
-	if err != nil {
-		return sessionCredentials{}, fmt.Errorf("marshal payload: %w", err)
-	}
-
-	// 4) prepare SigV4-X509 signing values
-	service := "rolesanywhere"
-	host := p.host
-	endpoint := p.endpoint
-	if host == "" {
-		host = fmt.Sprintf("%s.%s.amazonaws.com", service, p.Region)
-	}
-	if endpoint == "" {
-		endpoint = fmt.Sprintf("https://%s/sessions", host)
-	}
-	now := p.now().UTC()
-	amzDate := now.Format("20060102T150405Z")
-	dateStamp := now.Format("20060102")
-
-	contentType := "application/json"
-	canonicalURI := "/sessions"
-	canonicalQuerystring := ""
-
-	// canonical headers (lowercase, sorted)
-	canonicalHeaders := strings.Join([]string{
-		"content-type:" + contentType,
-		"host:" + host,
-		"x-amz-date:" + amzDate,
-		"x-amz-x509:" + certDerBase64,
-	}, "\n") + "\n"
-
-	signedHeaders := "content-type;host;x-amz-date;x-amz-x509"
-
-	payloadHash := sha256Hex(payloadBytes)
-
-	canonicalRequest := strings.Join([]string{
-		"POST",
-		canonicalURI,
-		canonicalQuerystring,
-		canonicalHeaders,
-		signedHeaders,
-		payloadHash,
-	}, "\n")
-
-	credentialScope := fmt.Sprintf("%s/%s/%s/aws4_request", dateStamp, p.Region, service)
-
-	stringToSign := strings.Join([]string{
-		algorithm,
-		amzDate,
-		credentialScope,
-		sha256Hex([]byte(canonicalRequest)),
-	}, "\n")
-
-	// RSA retains PKCS#1 v1.5; ECDSA uses an ASN.1 DER signature.
-	signature, err := signString(privKey, stringToSign)
-	if err != nil {
-		return sessionCredentials{}, fmt.Errorf("signing string: %w", err)
-	}
-
-	signatureHex := hex.EncodeToString(signature)
-
-	authorizationHeader := fmt.Sprintf("%s Credential=%s/%s, SignedHeaders=%s, Signature=%s",
-		algorithm, serialDec, credentialScope, signedHeaders, signatureHex)
-
-	// 5) perform HTTP POST
-	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(payloadBytes))
-	if err != nil {
-		return sessionCredentials{}, fmt.Errorf("creating request: %w", err)
-	}
-	req.Header.Set("Content-Type", contentType)
-	req.Header.Set("X-Amz-Date", amzDate)
-	req.Header.Set("X-Amz-X509", certDerBase64)
-	req.Header.Set("Authorization", authorizationHeader)
-	req.Header.Set("Accept", "application/json")
-
-	client := p.HTTPClient
-	if client == nil {
-		client = http.DefaultClient
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return sessionCredentials{}, fmt.Errorf("calling CreateSession: %w", err)
-	}
-	defer resp.Body.Close()
-
-	bodyBytes, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 201 {
-		return sessionCredentials{}, fmt.Errorf("CreateSession failed: status=%d body=%s", resp.StatusCode, string(bodyBytes))
-	}
-
-	var parsed createSessionResponse
-	if err := json.Unmarshal(bodyBytes, &parsed); err != nil {
-		return sessionCredentials{}, fmt.Errorf("parsing CreateSession response: %w (body=%s)", err, string(bodyBytes))
-	}
-
-	if len(parsed.CredentialSet) == 0 {
-		return sessionCredentials{}, fmt.Errorf("no credentialSet in response")
-	}
-
-	c := parsed.CredentialSet[0].Credentials
-	expiry, err := time.Parse(time.RFC3339, c.Expiration)
-	if err != nil {
-		// fallback: try without TZ (rare)
-		expiry, err = time.Parse("2006-01-02T15:04:05", c.Expiration)
-		if err != nil {
-			return sessionCredentials{}, fmt.Errorf("parsing expiration: %w (val=%s)", err, c.Expiration)
-		}
-	}
-
-	return sessionCredentials{
-		AccessKeyID:     c.AccessKeyID,
-		SecretAccessKey: c.SecretAccessKey,
-		SessionToken:    c.SessionToken,
-		Expiration:      expiry,
-	}, nil
 }
 
 // helpers
