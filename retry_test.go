@@ -30,6 +30,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"testing/iotest"
+	"testing/synctest"
 	"time"
 )
 
@@ -132,7 +133,7 @@ func TestProvider_RetryPolicy(t *testing.T) {
 			})
 			provider := newRetryTestProvider(t, &now, transport)
 
-			creds, err := provider.Retrieve(context.Background())
+			creds, err := provider.Retrieve(t.Context())
 			if tt.wantSuccess && err != nil {
 				t.Fatalf("Retrieve: %v", err)
 			}
@@ -159,15 +160,15 @@ func TestProvider_RetriesExhausted(t *testing.T) {
 		return resp, nil
 	}), WithMaxAttempts(3))
 
-	_, err := provider.Retrieve(context.Background())
+	_, err := provider.Retrieve(t.Context())
 	if err == nil {
 		t.Fatal("Retrieve succeeded, want an error")
 	}
 	if calls != 3 {
 		t.Fatalf("calls = %d, want 3", calls)
 	}
-	var apiErr *APIError
-	if !errors.As(err, &apiErr) {
+	apiErr, ok := errors.AsType[*APIError](err)
+	if !ok {
 		t.Fatalf("error type = %T, want *APIError", err)
 	}
 	if apiErr.StatusCode != http.StatusServiceUnavailable || apiErr.Code != "ServiceUnavailable" {
@@ -202,7 +203,7 @@ func TestProvider_TransportRetryPolicy(t *testing.T) {
 				return successHTTPResponse(req, now.Add(time.Hour)), nil
 			}))
 
-			_, err := provider.Retrieve(context.Background())
+			_, err := provider.Retrieve(t.Context())
 			if tt.wantSuccess && err != nil {
 				t.Fatalf("Retrieve: %v", err)
 			}
@@ -217,21 +218,23 @@ func TestProvider_TransportRetryPolicy(t *testing.T) {
 }
 
 func TestProvider_RequestTimeoutIsRetried(t *testing.T) {
-	now := time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
-	calls := 0
-	provider := newRetryTestProvider(t, &now, retryRoundTripper(func(req *http.Request) (*http.Response, error) {
-		calls++
-		<-req.Context().Done()
-		return nil, req.Context().Err()
-	}), WithRequestTimeout(5*time.Millisecond))
+	synctest.Test(t, func(t *testing.T) {
+		now := time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
+		calls := 0
+		provider := newRetryTestProvider(t, &now, retryRoundTripper(func(req *http.Request) (*http.Response, error) {
+			calls++
+			<-req.Context().Done()
+			return nil, req.Context().Err()
+		}), WithRequestTimeout(time.Second))
 
-	_, err := provider.Retrieve(context.Background())
-	if err == nil {
-		t.Fatal("Retrieve succeeded, want an error")
-	}
-	if calls != DefaultMaxAttempts {
-		t.Fatalf("calls = %d, want %d", calls, DefaultMaxAttempts)
-	}
+		_, err := provider.Retrieve(t.Context())
+		if err == nil {
+			t.Fatal("Retrieve succeeded, want an error")
+		}
+		if calls != DefaultMaxAttempts {
+			t.Fatalf("calls = %d, want %d", calls, DefaultMaxAttempts)
+		}
+	})
 }
 
 func TestProvider_CancellationStopsBackoff(t *testing.T) {
@@ -241,7 +244,7 @@ func TestProvider_CancellationStopsBackoff(t *testing.T) {
 		calls++
 		return errorHTTPResponse(req, http.StatusServiceUnavailable, "ServiceUnavailable", "try later"), nil
 	}))
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	provider.sleep = func(ctx context.Context, _ time.Duration) error {
 		cancel()
 		return ctx.Err()
@@ -251,8 +254,7 @@ func TestProvider_CancellationStopsBackoff(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want context.Canceled", err)
 	}
-	var apiErr *APIError
-	if !errors.As(err, &apiErr) {
+	if _, ok := errors.AsType[*APIError](err); !ok {
 		t.Fatalf("error = %v, want *APIError in chain", err)
 	}
 	if calls != 1 {
@@ -279,7 +281,7 @@ func TestProvider_RetryRebuildsSignedRequest(t *testing.T) {
 	}))
 	provider.SessionName = "workload-session"
 
-	if _, err := provider.Retrieve(context.Background()); err != nil {
+	if _, err := provider.Retrieve(t.Context()); err != nil {
 		t.Fatalf("Retrieve: %v", err)
 	}
 	if len(dates) != 2 || dates[0] == dates[1] {
@@ -353,7 +355,7 @@ func TestProvider_HonorsRetryAfter(t *testing.T) {
 		return nil
 	}
 
-	if _, err := provider.Retrieve(context.Background()); err != nil {
+	if _, err := provider.Retrieve(t.Context()); err != nil {
 		t.Fatalf("Retrieve: %v", err)
 	}
 	if len(delays) != 1 || delays[0] != DefaultMaxRetryDelay {
@@ -377,13 +379,11 @@ func TestProvider_ConcurrentRetrieveFetchesOnce(t *testing.T) {
 	const goroutines = 10
 	var wg sync.WaitGroup
 	errs := make(chan error, goroutines)
-	for i := 0; i < goroutines; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			_, err := provider.Retrieve(context.Background())
+	for range goroutines {
+		wg.Go(func() {
+			_, err := provider.Retrieve(t.Context())
 			errs <- err
-		}()
+		})
 	}
 	<-started
 	close(release)
@@ -400,30 +400,32 @@ func TestProvider_ConcurrentRetrieveFetchesOnce(t *testing.T) {
 }
 
 func TestProvider_ConcurrentWaiterCanCancel(t *testing.T) {
-	now := time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
-	started := make(chan struct{})
-	release := make(chan struct{})
-	provider := newRetryTestProvider(t, &now, retryRoundTripper(func(req *http.Request) (*http.Response, error) {
-		close(started)
-		<-release
-		return successHTTPResponse(req, now.Add(time.Hour)), nil
-	}))
-	leaderDone := make(chan error, 1)
-	go func() {
-		_, err := provider.Retrieve(context.Background())
-		leaderDone <- err
-	}()
-	<-started
+	synctest.Test(t, func(t *testing.T) {
+		now := time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
+		started := make(chan struct{})
+		release := make(chan struct{})
+		provider := newRetryTestProvider(t, &now, retryRoundTripper(func(req *http.Request) (*http.Response, error) {
+			close(started)
+			<-release
+			return successHTTPResponse(req, now.Add(time.Hour)), nil
+		}))
+		leaderDone := make(chan error, 1)
+		go func() {
+			_, err := provider.Retrieve(t.Context())
+			leaderDone <- err
+		}()
+		<-started
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
-	defer cancel()
-	if _, err := provider.Retrieve(ctx); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("waiter error = %v, want context.DeadlineExceeded", err)
-	}
-	close(release)
-	if err := <-leaderDone; err != nil {
-		t.Fatalf("leader Retrieve: %v", err)
-	}
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+		if _, err := provider.Retrieve(ctx); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("waiter error = %v, want context.DeadlineExceeded", err)
+		}
+		close(release)
+		if err := <-leaderDone; err != nil {
+			t.Fatalf("leader Retrieve: %v", err)
+		}
+	})
 }
 
 func TestProvider_UsesValidCredentialsAfterRefreshFailure(t *testing.T) {
@@ -437,12 +439,12 @@ func TestProvider_UsesValidCredentialsAfterRefreshFailure(t *testing.T) {
 		return errorHTTPResponse(req, http.StatusServiceUnavailable, "ServiceUnavailable", "try later"), nil
 	}))
 
-	first, err := provider.Retrieve(context.Background())
+	first, err := provider.Retrieve(t.Context())
 	if err != nil {
 		t.Fatalf("initial Retrieve: %v", err)
 	}
 	now = now.Add(6 * time.Minute)
-	second, err := provider.Retrieve(context.Background())
+	second, err := provider.Retrieve(t.Context())
 	if err != nil {
 		t.Fatalf("refresh Retrieve: %v", err)
 	}
@@ -452,7 +454,7 @@ func TestProvider_UsesValidCredentialsAfterRefreshFailure(t *testing.T) {
 	if calls != 1+DefaultMaxAttempts {
 		t.Fatalf("calls = %d, want %d", calls, 1+DefaultMaxAttempts)
 	}
-	if _, err := provider.Retrieve(context.Background()); err != nil {
+	if _, err := provider.Retrieve(t.Context()); err != nil {
 		t.Fatalf("Retrieve during refresh cooldown: %v", err)
 	}
 	if calls != 1+DefaultMaxAttempts {
@@ -471,11 +473,11 @@ func TestProvider_DoesNotUseExpiredCredentialsAfterRefreshFailure(t *testing.T) 
 		return errorHTTPResponse(req, http.StatusServiceUnavailable, "ServiceUnavailable", "try later"), nil
 	}))
 
-	if _, err := provider.Retrieve(context.Background()); err != nil {
+	if _, err := provider.Retrieve(t.Context()); err != nil {
 		t.Fatalf("initial Retrieve: %v", err)
 	}
 	now = now.Add(2 * time.Minute)
-	if _, err := provider.Retrieve(context.Background()); err == nil {
+	if _, err := provider.Retrieve(t.Context()); err == nil {
 		t.Fatal("Retrieve succeeded with expired cached credentials")
 	}
 }
@@ -497,7 +499,7 @@ func TestProvider_ResponseReadFailureIsRetried(t *testing.T) {
 		return successHTTPResponse(req, now.Add(time.Hour)), nil
 	}))
 
-	if _, err := provider.Retrieve(context.Background()); err != nil {
+	if _, err := provider.Retrieve(t.Context()); err != nil {
 		t.Fatalf("Retrieve: %v", err)
 	}
 	if calls != 2 {
@@ -529,7 +531,7 @@ func TestProvider_ResponseBodiesAreClosed(t *testing.T) {
 		}, nil
 	}))
 
-	if _, err := provider.Retrieve(context.Background()); err != nil {
+	if _, err := provider.Retrieve(t.Context()); err != nil {
 		t.Fatalf("Retrieve: %v", err)
 	}
 	if !firstBody.closed.Load() || !secondBody.closed.Load() {
@@ -550,7 +552,7 @@ func TestProvider_MalformedSuccessIsNotRetried(t *testing.T) {
 		}, nil
 	}))
 
-	if _, err := provider.Retrieve(context.Background()); err == nil {
+	if _, err := provider.Retrieve(t.Context()); err == nil {
 		t.Fatal("Retrieve succeeded, want a parsing error")
 	}
 	if calls != 1 {
@@ -595,9 +597,9 @@ func TestProvider_ErrorBodyIsBounded(t *testing.T) {
 		}, nil
 	}))
 
-	_, err := provider.Retrieve(context.Background())
-	var apiErr *APIError
-	if !errors.As(err, &apiErr) {
+	_, err := provider.Retrieve(t.Context())
+	apiErr, ok := errors.AsType[*APIError](err)
+	if !ok {
 		t.Fatalf("error = %v, want *APIError", err)
 	}
 	if len(apiErr.Body) != maxErrorBodyBytes+len("... (truncated)") {
@@ -636,7 +638,7 @@ func TestProvider_RejectsRedirects(t *testing.T) {
 	}
 	provider.sleep = func(context.Context, time.Duration) error { return nil }
 
-	if _, err := provider.Retrieve(context.Background()); !errors.Is(err, errUnexpectedRedirect) {
+	if _, err := provider.Retrieve(t.Context()); !errors.Is(err, errUnexpectedRedirect) {
 		t.Fatalf("error = %v, want redirect rejection", err)
 	}
 	if sourceCalls.Load() != 1 || targetCalls.Load() != 0 {

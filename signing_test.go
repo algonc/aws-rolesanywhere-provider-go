@@ -15,7 +15,6 @@
 package rolesanywhere
 
 import (
-	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
@@ -238,8 +237,8 @@ func TestProvider_Retrieve_SigningFormats(t *testing.T) {
 				)
 				return &http.Response{StatusCode: http.StatusCreated, Body: io.NopCloser(strings.NewReader(body))}, nil
 			})}
-			for i := 0; i < 2; i++ {
-				creds, err := p.Retrieve(context.Background())
+			for range 2 {
+				creds, err := p.Retrieve(t.Context())
 				if err != nil {
 					t.Fatalf("Retrieve: %v", err)
 				}
@@ -305,7 +304,7 @@ func TestProvider_Retrieve_KeyCertificateMismatch(t *testing.T) {
 				t.Error("mismatched key must be rejected before sending a request")
 				return nil, fmt.Errorf("unexpected request")
 			})}
-			_, err := p.Retrieve(context.Background())
+			_, err := p.Retrieve(t.Context())
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 				t.Fatalf("expected error containing %q, got %v", tt.wantErr, err)
 			}
@@ -326,7 +325,7 @@ func TestProvider_Retrieve_UnsupportedPrivateKey(t *testing.T) {
 		}
 		return keyPEM, nil
 	}
-	_, err = p.Retrieve(context.Background())
+	_, err = p.Retrieve(t.Context())
 	if err == nil || !strings.Contains(err.Error(), "unsupported private key type") {
 		t.Fatalf("expected unsupported private key error, got %v", err)
 	}

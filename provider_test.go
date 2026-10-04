@@ -15,7 +15,6 @@
 package rolesanywhere
 
 import (
-	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -111,7 +110,7 @@ func TestProvider_Retrieve_Success(t *testing.T) {
 		return certPEM, nil
 	}
 
-	creds, err := p.Retrieve(context.Background())
+	creds, err := p.Retrieve(t.Context())
 	if err != nil {
 		t.Fatalf("Retrieve failed: %v", err)
 	}
@@ -162,12 +161,12 @@ func TestProvider_Retrieve_UsesCache(t *testing.T) {
 		return certPEM, nil
 	}
 
-	_, err := p.Retrieve(context.Background())
+	_, err := p.Retrieve(t.Context())
 	if err != nil {
 		t.Fatalf("first Retrieve failed: %v", err)
 	}
 
-	_, err = p.Retrieve(context.Background())
+	_, err = p.Retrieve(t.Context())
 	if err != nil {
 		t.Fatalf("second Retrieve failed: %v", err)
 	}
@@ -202,7 +201,7 @@ func TestProvider_Retrieve_HTTPError(t *testing.T) {
 		return certPEM, nil
 	}
 
-	_, err := p.Retrieve(context.Background())
+	_, err := p.Retrieve(t.Context())
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
