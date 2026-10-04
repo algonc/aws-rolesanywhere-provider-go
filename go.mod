@@ -1,7 +1,17 @@
 module github.com/algonc/aws-rolesanywhere-provider-go
 
-go 1.26.0
+go 1.26.8
 
 require github.com/aws/aws-sdk-go-v2 v1.47.1
 
-require github.com/aws/smithy-go v1.28.2 // indirect
+require (
+	github.com/aws/smithy-go v1.28.2 // indirect
+	golang.org/x/mod v0.35.0 // indirect
+	golang.org/x/sync v0.20.0 // indirect
+	golang.org/x/sys v0.43.0 // indirect
+	golang.org/x/telemetry v0.0.0-20260421165255-392afab6f40e // indirect
+	golang.org/x/tools v0.44.0 // indirect
+	golang.org/x/vuln v1.3.0 // indirect
+)
+
+tool golang.org/x/vuln/cmd/govulncheck
