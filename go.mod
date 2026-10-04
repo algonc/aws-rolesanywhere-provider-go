@@ -1,6 +1,6 @@
 module github.com/algonc/aws-rolesanywhere-provider-go
 
-go 1.26.8
+go 1.26.0
 
 require github.com/aws/aws-sdk-go-v2 v1.47.1
 
