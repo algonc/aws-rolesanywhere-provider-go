@@ -160,12 +160,10 @@ func (p *Provider) shouldRetry(ctx context.Context, err error) bool {
 	if ctx.Err() != nil {
 		return false
 	}
-	var permanentErr permanentError
-	if errors.As(err, &permanentErr) {
+	if _, ok := errors.AsType[permanentError](err); ok {
 		return false
 	}
-	var apiErr *APIError
-	if errors.As(err, &apiErr) {
+	if apiErr, ok := errors.AsType[*APIError](err); ok {
 		if isRetryableErrorCode(apiErr.Code) {
 			return true
 		}
@@ -204,8 +202,8 @@ func isRetryableErrorCode(code string) bool {
 }
 
 func isThrottleError(err error) bool {
-	var apiErr *APIError
-	if !errors.As(err, &apiErr) {
+	apiErr, ok := errors.AsType[*APIError](err)
+	if !ok {
 		return false
 	}
 	if apiErr.StatusCode == http.StatusTooManyRequests {
@@ -218,25 +216,26 @@ func isRetryableTransportError(err error) bool {
 	if errors.Is(err, context.Canceled) || errors.Is(err, errUnexpectedRedirect) {
 		return false
 	}
-	var unknownAuthority x509.UnknownAuthorityError
-	var hostnameError x509.HostnameError
-	var certificateInvalid x509.CertificateInvalidError
-	var verificationError *tls.CertificateVerificationError
-	var recordHeaderError tls.RecordHeaderError
-	if errors.As(err, &unknownAuthority) ||
-		errors.As(err, &hostnameError) ||
-		errors.As(err, &certificateInvalid) ||
-		errors.As(err, &verificationError) ||
-		errors.As(err, &recordHeaderError) {
+	if _, ok := errors.AsType[x509.UnknownAuthorityError](err); ok {
+		return false
+	}
+	if _, ok := errors.AsType[x509.HostnameError](err); ok {
+		return false
+	}
+	if _, ok := errors.AsType[x509.CertificateInvalidError](err); ok {
+		return false
+	}
+	if _, ok := errors.AsType[*tls.CertificateVerificationError](err); ok {
+		return false
+	}
+	if _, ok := errors.AsType[tls.RecordHeaderError](err); ok {
 		return false
 	}
 
-	var dnsError *net.DNSError
-	if errors.As(err, &dnsError) {
+	if dnsError, ok := errors.AsType[*net.DNSError](err); ok {
 		return !dnsError.IsNotFound
 	}
-	var urlError *url.Error
-	if errors.As(err, &urlError) {
+	if urlError, ok := errors.AsType[*url.Error](err); ok {
 		if strings.Contains(urlError.Error(), "unsupported protocol scheme") ||
 			strings.Contains(urlError.Error(), "invalid header") {
 			return false
@@ -264,13 +263,8 @@ func (p *Provider) retryDelay(retry int, err error) time.Duration {
 		delay = p.maxRetryDelay
 	}
 
-	var apiErr *APIError
-	if errors.As(err, &apiErr) && apiErr.RetryAfter > 0 {
-		delay = apiErr.RetryAfter
-		if delay > p.maxRetryDelay {
-			delay = p.maxRetryDelay
-		}
-		return delay
+	if apiErr, ok := errors.AsType[*APIError](err); ok && apiErr.RetryAfter > 0 {
+		return min(apiErr.RetryAfter, p.maxRetryDelay)
 	}
 
 	random := randv2.Float64
