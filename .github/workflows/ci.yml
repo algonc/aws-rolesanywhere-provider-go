@@ -84,7 +84,12 @@ jobs:
           fi
 
       - name: Check vulnerabilities
-        run: go tool govulncheck ./...
+        # `go tool govulncheck` requires a tool dependency in go.mod. Keep this
+        # CI-only executable out of the library's module graph: a versioned
+        # `go run` uses an isolated module context and ignores the local go.mod.
+        # https://go.dev/ref/mod#go-mod-file-tool
+        # https://pkg.go.dev/cmd/go#hdr-Compile_and_run_Go_program
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.3.0 ./...
 
       - name: Build
         run: go build ./...
