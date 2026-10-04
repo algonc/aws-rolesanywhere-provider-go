@@ -384,15 +384,16 @@ func validatePrivateKeyMatchesCertificate(privateKey crypto.PrivateKey, cert *x5
 }
 
 func signString(privateKey crypto.PrivateKey, stringToSign string) ([]byte, error) {
-	digest := sha256Bytes([]byte(stringToSign))
+	var signer crypto.Signer
 	switch key := privateKey.(type) {
 	case *rsa.PrivateKey:
-		return rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, digest)
+		signer = key
 	case *ecdsa.PrivateKey:
-		return ecdsa.SignASN1(rand.Reader, key, digest)
+		signer = key
 	default:
 		return nil, fmt.Errorf("unsupported private key type %T; expected RSA or ECDSA", privateKey)
 	}
+	return crypto.SignMessage(signer, rand.Reader, []byte(stringToSign), crypto.SHA256)
 }
 
 func parseCertificate(pemBytes []byte) (*x509.Certificate, error) {
@@ -410,9 +411,4 @@ func parseCertificate(pemBytes []byte) (*x509.Certificate, error) {
 func sha256Hex(b []byte) string {
 	h := sha256.Sum256(b)
 	return hex.EncodeToString(h[:])
-}
-
-func sha256Bytes(b []byte) []byte {
-	h := sha256.Sum256(b)
-	return h[:]
 }
