@@ -1,0 +1,93 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Validate Go module version tag
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          # The module path has no major-version suffix, so it supports v0 and v1 tags.
+          prerelease_id='(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)'
+          version_pattern="^v[01]\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-${prerelease_id}(\.${prerelease_id})*)?$"
+          if [[ ! "$RELEASE_TAG" =~ $version_pattern ]]; then
+            printf 'Invalid Go module tag: %s. Expected v0.MINOR.PATCH or v1.MINOR.PATCH, optionally with a prerelease suffix such as -rc.1.\n' "$RELEASE_TAG" >&2
+            exit 1
+          fi
+
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Check Go module files
+        run: go mod tidy -diff
+
+      - name: Verify dependencies
+        run: go mod verify
+
+      - name: Run tests
+        run: go test -count=1 ./...
+
+      - name: Run vet
+        run: go vet ./...
+
+      - name: Check for data races
+        if: runner.os == 'Linux'
+        env:
+          CGO_ENABLED: '1'
+        run: go test -race -count=1 ./...
+
+  publish:
+    name: Publish GitHub release
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          prerelease_args=()
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            prerelease_args+=(--prerelease --latest=false)
+          fi
+
+          gh release create "$RELEASE_TAG" \
+            --verify-tag \
+            --generate-notes \
+            --title "${GH_REPO##*/} $RELEASE_TAG" \
+            "${prerelease_args[@]}"
