@@ -95,6 +95,10 @@ The provider detects the key type automatically. Supported PEM formats are:
 
 Private keys must be unencrypted and match the certificate's public key.
 
+## Releasing
+
+See the [release guide](RELEASING.md) for the maintainer release process.
+
 ## License
 
 Licensed under the Apache License 2.0.
